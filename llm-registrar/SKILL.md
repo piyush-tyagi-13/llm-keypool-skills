@@ -5,124 +5,123 @@ description: Semi-autonomous signup for free-tier LLM API providers. Given a pro
 
 # llm-registrar
 
-Registers for a free-tier LLM API provider and loads the resulting key into llm-keypool. Semi-autonomous - handles email verification automatically, pauses and emails the user when a CAPTCHA is encountered.
+## IMPORTANT - execute commands, do not reason
 
-## When to use
+Every step below is a shell command or browser-harness script to run. Do not describe, summarize, or ask the user anything unless a step explicitly says to. Run each step in sequence.
 
-User asks: "register me for <provider>", "sign me up for <provider>", "get an API key for <provider>", "run llm-registrar for <provider>"
+## Invocation
 
-## Critical rules
+User says: "run llm-registrar for <provider>" or "register me for <provider>" or "get an API key for <provider>"
 
-- NEVER ask the user to check their email - the registrar.py scripts handle all inbox polling automatically
-- NEVER ask the user to solve a CAPTCHA in chat - run captcha-alert then wait-reply, those scripts handle it
-- NEVER describe steps and wait - execute each step as a shell command immediately
-- The hermes email inbox (EMAIL_ADDRESS) receives all verification emails, not the user's personal email
+## Step 1 - Get provider details from scout DB
 
-## Prerequisites
-
-- browser-harness skill available
-- llm-scout DB initialized (for provider metadata)
-- llm-keypool installed and on PATH
-- EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST, EMAIL_ALLOWED_USERS env vars set
-
-## Workflow
-
-### Step 1 - Look up provider
+Run immediately:
 
 ```bash
-python ~/.hermes/skills/llm-keypool-skills/llm-scout/scout.py list
+python3 ~/.hermes/skills/llm-keypool-skills/llm-scout/scout.py list
 ```
 
-Find the provider by name. Get: `signup_url`, `base_url`, `models`, `tool_calls`.
+Find the provider entry. Get `signup_url`, `base_url`, `models`. If `signup_url` is empty, search the web for "<provider> free API signup" and use the result.
 
-If provider not in DB, ask user to confirm the signup URL before proceeding.
+## Step 2 - Open signup page
 
-### Step 2 - Navigate signup
+Run immediately:
 
-Use browser-harness. Open signup URL in new tab:
-
-```python
+```bash
 browser-harness <<'PY'
-new_tab("<signup_url>")
+new_tab("<signup_url from step 1>")
 wait_for_load()
 capture_screenshot()
 PY
 ```
 
-Fill the signup form using hermes's own email address (EMAIL_ADDRESS env var).
+## Step 3 - Fill signup form
 
-For name fields: use "Hermes Agent" or "AI Assistant".
-For password: generate a random 16-char alphanumeric string. Save it in the notes field via `registrar.py save-password <provider> <password>`.
-Do NOT use the user's personal passwords.
+Use the hermes email address from the EMAIL_ADDRESS environment variable. Fill:
+- Email: value of $EMAIL_ADDRESS
+- Name: "Hermes Agent"
+- Password: generate a random 16-char alphanumeric string
 
-### Step 3 - Email verification
-
-After submitting the signup form, immediately run this command. Do NOT ask the user to check their email - the script polls the hermes inbox automatically:
-
-```bash
-python ~/.hermes/skills/llm-keypool-skills/llm-registrar/registrar.py wait-verify <provider>
-```
-
-This polls IMAP every 30s for up to 10 minutes. When it prints a URL, navigate to that URL via browser-harness to complete verification. Do not proceed until the script returns a link.
-
-### Step 4 - CAPTCHA handling
-
-If you encounter a CAPTCHA (Cloudflare Turnstile, reCAPTCHA, hCaptcha) at any point:
-
-1. Take a screenshot to confirm it is a CAPTCHA
-2. Immediately run - do NOT ask the user in chat:
-```bash
-python ~/.hermes/skills/llm-keypool-skills/llm-registrar/registrar.py captcha-alert <provider> <current_url>
-```
-3. Immediately run - do NOT wait in chat, the script polls automatically:
-```bash
-python ~/.hermes/skills/llm-keypool-skills/llm-registrar/registrar.py wait-reply <provider>
-```
-4. Once the script returns: take a fresh screenshot, confirm CAPTCHA is gone, continue.
-
-### Step 5 - Find the API key
-
-After successful signup/login, navigate to the provider's API keys page. Common patterns:
-- Look for "API Keys", "Developer", "Settings" in the navigation
-- Common URLs: `/settings/api-keys`, `/api-keys`, `/account/api-keys`, `/dashboard/api-keys`
-- Take a screenshot to find the correct navigation
-
-Create a new API key if needed. Copy the key value.
-
-### Step 6 - Add to llm-keypool
-
-Determine the best model for the key - prefer tool-call-capable models, llama-3.x family:
+Save the generated password immediately:
 
 ```bash
-llm-keypool add --provider <provider_name> --key <api_key> --model <model_name> --category general_purpose
+python3 ~/.hermes/skills/llm-keypool-skills/llm-registrar/registrar.py save-password <provider> <generated_password>
 ```
 
-If llm-keypool does not have a built-in provider entry for this provider, use `--provider openrouter` with the provider's base_url override if supported, or add as a custom entry.
+Submit the form via browser-harness.
 
-Then mark the provider as registered in the scout DB:
+## Step 4 - Poll for verification email
+
+Run immediately after form submit. Do NOT ask the user to check email:
 
 ```bash
-python ~/.hermes/skills/llm-keypool-skills/llm-scout/scout.py mark-registered <provider>
+python3 ~/.hermes/skills/llm-keypool-skills/llm-registrar/registrar.py wait-verify <provider>
 ```
 
-### Step 7 - Send report
+When the script prints a URL, navigate to it:
 
 ```bash
-python ~/.hermes/skills/llm-keypool-skills/llm-registrar/registrar.py send-report <provider> <model> <success|failed> <notes>
+browser-harness <<'PY'
+new_tab("<url printed by wait-verify>")
+wait_for_load()
+capture_screenshot()
+PY
 ```
 
-Emails the user a summary of what happened.
+## Step 5 - Handle CAPTCHA (only if encountered)
 
-## Error handling
+If a screenshot shows a CAPTCHA, run immediately - do not ask user in chat:
 
-- If signup page requires phone verification: stop, email user explaining phone verification required, skip provider
-- If terms require human agreement review: show the key terms to the user in chat before proceeding
-- If API key page is not findable after 5 minutes: stop, email user asking them to extract the key manually
-- Always email user on completion or failure
+```bash
+python3 ~/.hermes/skills/llm-keypool-skills/llm-registrar/registrar.py captcha-alert <provider> <current_url>
+```
 
-## Notes
+Then poll for user's reply - do not wait in chat:
 
-- Only use EMAIL_ADDRESS (hermes's own email) for signups - never the user's personal email
-- Hermes's email is: read from EMAIL_ADDRESS env var
-- Store generated passwords in registrar.py's local DB - never reuse across providers
-- Each provider gets its own account on hermes's email
+```bash
+python3 ~/.hermes/skills/llm-keypool-skills/llm-registrar/registrar.py wait-reply <provider>
+```
+
+After script returns, take a new screenshot and continue.
+
+## Step 6 - Find and copy the API key
+
+Navigate to the API keys page. Common patterns to try in order:
+- Look for "API Keys" or "Developer" in the nav menu
+- Try URLs: `/api-keys`, `/settings/api-keys`, `/account/api-keys`, `/dashboard`
+
+Take a screenshot. Create a new key if needed. Copy the key value.
+
+## Step 7 - Add to llm-keypool
+
+Run immediately:
+
+```bash
+llm-keypool add --provider <provider> --key <api_key> --model <best_model_from_step_1> --category general_purpose
+```
+
+Then mark as registered in scout DB:
+
+```bash
+python3 ~/.hermes/skills/llm-keypool-skills/llm-scout/scout.py mark-registered <provider>
+```
+
+## Step 8 - Send completion report
+
+Run immediately:
+
+```bash
+python3 ~/.hermes/skills/llm-keypool-skills/llm-registrar/registrar.py send-report <provider> <model> success
+```
+
+Or on failure:
+
+```bash
+python3 ~/.hermes/skills/llm-keypool-skills/llm-registrar/registrar.py send-report <provider> "" failed "<reason>"
+```
+
+## Stop conditions (only times to pause and ask user)
+
+- Signup page requires phone number verification
+- After 5 minutes cannot find API key page
+- Provider requires paid plan to access API
