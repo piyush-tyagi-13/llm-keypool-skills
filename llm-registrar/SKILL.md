@@ -11,6 +11,13 @@ Registers for a free-tier LLM API provider and loads the resulting key into llm-
 
 User asks: "register me for <provider>", "sign me up for <provider>", "get an API key for <provider>", "run llm-registrar for <provider>"
 
+## Critical rules
+
+- NEVER ask the user to check their email - the registrar.py scripts handle all inbox polling automatically
+- NEVER ask the user to solve a CAPTCHA in chat - run captcha-alert then wait-reply, those scripts handle it
+- NEVER describe steps and wait - execute each step as a shell command immediately
+- The hermes email inbox (EMAIL_ADDRESS) receives all verification emails, not the user's personal email
+
 ## Prerequisites
 
 - browser-harness skill available
@@ -50,32 +57,28 @@ Do NOT use the user's personal passwords.
 
 ### Step 3 - Email verification
 
-After submitting the signup form, watch the EMAIL_ADDRESS inbox for a verification email:
+After submitting the signup form, immediately run this command. Do NOT ask the user to check their email - the script polls the hermes inbox automatically:
 
 ```bash
 python ~/.hermes/skills/llm-keypool-skills/llm-registrar/registrar.py wait-verify <provider>
 ```
 
-This polls IMAP every 30s for up to 10 minutes for an email from the provider containing a verification link. When found, it prints the link. Navigate to that link via browser-harness to complete verification.
+This polls IMAP every 30s for up to 10 minutes. When it prints a URL, navigate to that URL via browser-harness to complete verification. Do not proceed until the script returns a link.
 
 ### Step 4 - CAPTCHA handling
 
 If you encounter a CAPTCHA (Cloudflare Turnstile, reCAPTCHA, hCaptcha) at any point:
 
-1. Take a screenshot
-2. Run:
+1. Take a screenshot to confirm it is a CAPTCHA
+2. Immediately run - do NOT ask the user in chat:
 ```bash
 python ~/.hermes/skills/llm-keypool-skills/llm-registrar/registrar.py captcha-alert <provider> <current_url>
 ```
-This emails the user with the URL and instructions to solve the CAPTCHA and reply.
-
-3. Wait for reply in inbox:
+3. Immediately run - do NOT wait in chat, the script polls automatically:
 ```bash
 python ~/.hermes/skills/llm-keypool-skills/llm-registrar/registrar.py wait-reply <provider>
 ```
-Polls inbox every 60s for up to 30 minutes. Returns when user replies "done" or "solved".
-
-4. After reply: take a fresh screenshot, verify CAPTCHA is gone, continue.
+4. Once the script returns: take a fresh screenshot, confirm CAPTCHA is gone, continue.
 
 ### Step 5 - Find the API key
 
