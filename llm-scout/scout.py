@@ -84,7 +84,7 @@ def init():
             if not existing:
                 conn.execute("""
                     INSERT INTO providers (name, base_url, free_tier, tool_calls, models, first_seen, last_seen, is_new, registered)
-                    VALUES (?, ?, 1, 0, ?, ?, ?, 0, 1)
+                    VALUES (?, ?, 1, 0, ?, ?, ?, 0, 0)
                 """, (name, cfg.get("base_url", ""), json.dumps(models), now, now))
                 seeded += 1
         conn.commit()
@@ -95,6 +95,7 @@ def init():
     total = conn.execute("SELECT COUNT(*) FROM providers").fetchone()[0]
     print(f"DB ready at {DB_PATH} ({total} providers)", file=sys.stderr)
     conn.close()
+    sync_registered()
 
 
 def list_all():
@@ -174,6 +175,30 @@ def add(provider_json: str):
 
     conn.commit()
     conn.close()
+
+
+def sync_registered():
+    """Cross-reference llm-keypool status to mark which providers actually have keys."""
+    import subprocess
+    try:
+        result = subprocess.run(["llm-keypool", "status"], capture_output=True, text=True, timeout=30)
+        output = result.stdout.lower()
+    except Exception as e:
+        print(f"Error running llm-keypool status: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    conn = _connect()
+    rows = conn.execute("SELECT name FROM providers").fetchall()
+    updated = 0
+    for row in rows:
+        name = row["name"].lower()
+        has_key = name in output
+        conn.execute("UPDATE providers SET registered=? WHERE name=?", (1 if has_key else 0, name))
+        if has_key:
+            updated += 1
+    conn.commit()
+    conn.close()
+    print(f"Synced: {updated} providers marked as registered")
 
 
 def mark_registered(name: str, api_key: str = ""):
@@ -310,6 +335,8 @@ if __name__ == "__main__":
         list_unregistered()
     elif cmd == "add":
         add(sys.argv[2])
+    elif cmd == "sync":
+        sync_registered()
     elif cmd == "mark-seen":
         mark_seen()
     elif cmd == "mark-registered":
