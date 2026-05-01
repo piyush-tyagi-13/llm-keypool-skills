@@ -15,7 +15,7 @@ Hermes Agent skills for autonomous free-tier LLM API management. Works with [llm
 ### 1. Clone this repo
 
 ```bash
-git clone https://github.com/piyushtyagi/llm-keypool-skills ~/.hermes/skills/llm-keypool-skills
+git clone https://github.com/piyush-tyagi-13/llm-keypool-skills ~/.hermes/skills/llm-keypool-skills
 ```
 
 ### 2. Add to hermes config
