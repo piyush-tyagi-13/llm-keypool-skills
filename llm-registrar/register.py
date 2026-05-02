@@ -30,6 +30,25 @@ SCRIPT_DIR = Path(__file__).parent
 SCOUT_PY = SCRIPT_DIR.parent / "llm-scout" / "scout.py"
 SCOUT_DB = Path(os.environ.get("SCOUT_DB", SCRIPT_DIR.parent / "llm-scout" / "providers.db"))
 
+
+def _load_hermes_env():
+    """Load email credentials from ~/.hermes/.env if not already in environment."""
+    env_file = Path.home() / ".hermes" / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k and k not in os.environ:
+            os.environ[k] = v
+
+
+_load_hermes_env()
+
 EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
 IMAP_HOST = os.environ.get("EMAIL_IMAP_HOST", "imap.gmail.com")

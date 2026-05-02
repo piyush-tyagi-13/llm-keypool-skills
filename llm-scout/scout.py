@@ -23,6 +23,21 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
+def _load_hermes_env():
+    env_file = Path.home() / ".hermes" / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip(); v = v.strip().strip('"').strip("'")
+        if k and k not in os.environ:
+            os.environ[k] = v
+
+_load_hermes_env()
+
 DB_PATH = Path(os.environ.get("SCOUT_DB", Path(__file__).parent / "providers.db"))
 
 _SEARCH_PATHS = [
