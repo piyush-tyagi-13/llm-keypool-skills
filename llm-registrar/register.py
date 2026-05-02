@@ -102,9 +102,9 @@ _BH = _find_bh()
 
 
 def bh(code: str, timeout: int = 60) -> str:
-    """Run Python code via browser-harness stdin. Return stdout+stderr."""
+    """Run Python code via browser-harness -c flag. Return stdout+stderr."""
     try:
-        r = subprocess.run([_BH], input=code, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run([_BH, "-c", code], capture_output=True, text=True, timeout=timeout)
         return ((r.stdout or "") + (r.stderr or "")).strip()
     except FileNotFoundError:
         print(f"[register] ERROR: browser-harness not found (tried: {_BH})", file=sys.stderr)
