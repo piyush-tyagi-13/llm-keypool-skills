@@ -27,7 +27,7 @@ def _load_hermes_env():
             continue
         k, _, v = line.partition("=")
         k = k.strip(); v = v.strip().strip('"').strip("'")
-        if k and k not in os.environ:
+        if k and not os.environ.get(k):
             os.environ[k] = v
 
 _load_hermes_env()
