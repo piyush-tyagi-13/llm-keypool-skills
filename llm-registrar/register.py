@@ -1,292 +1,397 @@
 #!/usr/bin/env python3
 """
-register.py <provider> <command> [args]
+Fully autonomous provider signup. Drives browser-harness via subprocess.
+No hermes involvement after launch - runs end to end.
 
-State-machine registrar. Each command does its automation then prints the exact
-next step for hermes to follow. Hermes reads output and executes the next command.
+Usage:
+  python3 register.py <provider>
 
-Commands:
-  start              - look up provider, print browser instructions + next command
-  verify             - poll inbox for verification email, navigate to link
-  getkey             - print instructions to find API key page
-  addkey <api_key>   - add key to llm-keypool, mark registered, email report
-  fail <reason>      - mark failed, email report
-  status             - show current registration state
+Supported: sambanova, cohere, cloudflare
 """
 
+import email as email_lib
+import imaplib
 import json
 import os
+import re
+import secrets
+import smtplib
 import sqlite3
+import string
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
+SCOUT_PY = SCRIPT_DIR.parent / "llm-scout" / "scout.py"
 SCOUT_DB = Path(os.environ.get("SCOUT_DB", SCRIPT_DIR.parent / "llm-scout" / "providers.db"))
-REG_DB = Path(os.environ.get("REGISTRAR_DB", SCRIPT_DIR / "registrar.db"))
 
 EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
-EMAIL_IMAP_HOST = os.environ.get("EMAIL_IMAP_HOST", "imap.gmail.com")
-EMAIL_SMTP_HOST = os.environ.get("EMAIL_SMTP_HOST", "smtp.gmail.com")
+IMAP_HOST = os.environ.get("EMAIL_IMAP_HOST", "imap.gmail.com")
+SMTP_HOST = os.environ.get("EMAIL_SMTP_HOST", "smtp.gmail.com")
 USER_EMAIL = (os.environ.get("EMAIL_ALLOWED_USERS", "") or "").split(",")[0].strip()
 
-REGISTRAR_PY = SCRIPT_DIR / "registrar.py"
+PROVIDERS = {
+    "sambanova": {
+        "name": "SambaNova",
+        "signup_url": "https://cloud.sambanova.ai",
+        "api_key_url": "https://cloud.sambanova.ai/apis",
+        "model": "Meta-Llama-3.3-70B-Instruct",
+        "email_hint": "sambanova",
+    },
+    "cohere": {
+        "name": "Cohere",
+        "signup_url": "https://dashboard.cohere.com/register",
+        "api_key_url": "https://dashboard.cohere.com/api-keys",
+        "model": "command-r-plus-08-2024",
+        "email_hint": "cohere",
+    },
+    "cloudflare": {
+        "name": "Cloudflare",
+        "signup_url": "https://dash.cloudflare.com/sign-up",
+        "api_key_url": "https://dash.cloudflare.com/profile/api-tokens",
+        "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "email_hint": "cloudflare",
+        "notes": "Requires account_id in base_url - check Workers AI after registration",
+    },
+}
+
+# ── browser-harness ────────────────────────────────────────────────────────────
+
+def bh(code: str, timeout: int = 60) -> str:
+    """Run Python code via browser-harness stdin. Return stdout+stderr."""
+    try:
+        r = subprocess.run(["browser-harness"], input=code, capture_output=True, text=True, timeout=timeout)
+        return ((r.stdout or "") + (r.stderr or "")).strip()
+    except FileNotFoundError:
+        print("[register] ERROR: browser-harness not on PATH", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        return "[TIMEOUT]"
 
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
-
-def _reg_db():
-    conn = sqlite3.connect(REG_DB)
-    conn.row_factory = sqlite3.Row
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS registrations (
-            provider   TEXT PRIMARY KEY,
-            state      TEXT DEFAULT 'pending',
-            signup_url TEXT,
-            password   TEXT,
-            api_key    TEXT,
-            model      TEXT,
-            notes      TEXT,
-            updated_at TEXT
-        )
-    """)
-    conn.commit()
-    return conn
+def bh_json(code: str, timeout: int = 60) -> dict:
+    out = bh(code, timeout)
+    # find last JSON object in output
+    for m in reversed(list(re.finditer(r'\{[^{}]{2,}\}', out, re.DOTALL))):
+        try:
+            return json.loads(m.group())
+        except Exception:
+            pass
+    return {"raw": out}
 
 
-def _set_state(provider: str, state: str, **kwargs):
-    conn = _reg_db()
-    now = datetime.now(timezone.utc).isoformat()
-    row = dict(conn.execute("SELECT * FROM registrations WHERE provider=?", (provider,)).fetchone() or {})
-    row.update({"provider": provider, "state": state, "updated_at": now})
-    row.update(kwargs)
-    conn.execute("""
-        INSERT OR REPLACE INTO registrations (provider, state, signup_url, password, api_key, model, notes, updated_at)
-        VALUES (:provider, :state, :signup_url, :password, :api_key, :model, :notes, :updated_at)
-    """, {k: row.get(k) for k in ("provider", "state", "signup_url", "password", "api_key", "model", "notes", "updated_at")})
-    conn.commit()
-    conn.close()
+# ── signup helpers ─────────────────────────────────────────────────────────────
+
+_FILL_JS = r"""(function(em, pw) {
+    function find(sels) { for (var s of sels) { var e=document.querySelector(s); if(e) return e; } return null; }
+    function fill(e, v) {
+        if (!e) return false;
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e, v);
+        e.dispatchEvent(new Event('input',{bubbles:true}));
+        e.dispatchEvent(new Event('change',{bubbles:true}));
+        return true;
+    }
+    fill(find(['input[type="email"]','input[name="email"]','input[id*="email" i]','input[placeholder*="email" i]']), em);
+    fill(find(['input[type="password"]','input[name="password"]','input[id*="password" i]']), pw);
+    fill(find(['input[name="name"]','input[name="full_name"]','input[id*="name" i]','input[placeholder*="full name" i]']), 'Hermes Agent');
+    fill(find(['input[name="first_name"]','input[name="firstName"]','input[id*="first" i]','input[placeholder*="first" i]']), 'Hermes');
+    fill(find(['input[name="last_name"]','input[name="lastName"]','input[id*="last" i]','input[placeholder*="last" i]']), 'Agent');
+    var body = document.body.innerHTML.toLowerCase();
+    var cap = body.includes('captcha')||body.includes('turnstile')||body.includes('hcaptcha')||body.includes('cf-challenge');
+    var sub = document.querySelector('button[type="submit"]') ||
+        Array.from(document.querySelectorAll('button')).find(b=>/sign.?up|register|create|get.?start|continue/i.test(b.innerText));
+    return JSON.stringify({captcha:cap, submit:!!sub, url:location.href, title:document.title});
+})('EMAIL','PASSWORD')"""
+
+_SUBMIT_JS = r"""(function() {
+    var btn = document.querySelector('button[type="submit"]') ||
+        Array.from(document.querySelectorAll('button')).find(b=>/sign.?up|register|create|continue/i.test(b.innerText));
+    if (btn) { btn.click(); return {clicked:true, text:btn.innerText.trim()}; }
+    return {clicked:false};
+})()"""
+
+_FIND_KEY_JS = r"""(function() {
+    var inputs = Array.from(document.querySelectorAll('input,textarea')).map(i=>(i.value||'').trim()).filter(v=>v.length>20&&v.length<300);
+    var codes = Array.from(document.querySelectorAll('code,pre,[class*="key"],[class*="token"],[class*="secret"],[class*="api-key"]'))
+        .map(e=>e.innerText.trim()).filter(v=>v.length>20&&v.length<300&&/^[A-Za-z0-9_\-\.]+$/.test(v));
+    var create = Array.from(document.querySelectorAll('button,a')).find(b=>/create|add|generate|new.*key/i.test(b.innerText));
+    return JSON.stringify({inputs:inputs.slice(0,5), codes:codes.slice(0,5), hasCreate:!!create, url:location.href, title:document.title});
+})()"""
 
 
-def _get_state(provider: str) -> dict:
-    conn = _reg_db()
-    row = conn.execute("SELECT * FROM registrations WHERE provider=?", (provider,)).fetchone()
-    conn.close()
-    return dict(row) if row else {}
+def navigate_fill_submit(signup_url: str, email: str, password: str) -> dict:
+    fill_js = _FILL_JS.replace("EMAIL", email).replace("PASSWORD", password)
+    code = f"""
+import json, time
+new_tab({json.dumps(signup_url)})
+wait_for_load()
+time.sleep(2)
+fill_r = js({json.dumps(fill_js)})
+print("FILL:" + (fill_r if isinstance(fill_r, str) else json.dumps(fill_r)))
+"""
+    out = bh(code, timeout=30)
+    fill_data = {}
+    m = re.search(r'FILL:(\{.*\})', out)
+    if m:
+        try:
+            fill_data = json.loads(m.group(1))
+        except Exception:
+            pass
+
+    if fill_data.get("captcha"):
+        return {**fill_data, "stage": "pre_submit"}
+
+    # submit
+    code2 = f"""
+import json, time
+sub_r = js({json.dumps(_SUBMIT_JS)})
+time.sleep(3)
+wait_for_load()
+time.sleep(2)
+body = js('document.body.innerHTML.toLowerCase()') or ''
+info = page_info()
+cap = any(k in body for k in ['captcha','turnstile','hcaptcha','cf-challenge'])
+err = any(k in body for k in ['error','invalid','already exists','already registered'])
+ok  = any(k in body for k in ['verify','check your email','confirmation','thank you','success','check your inbox'])
+print(json.dumps({{'submitted': sub_r, 'captcha': cap, 'error': err, 'success': ok, 'url': info.get('url',''), 'title': info.get('title',''), 'stage': 'post_submit'}}))
+"""
+    return bh_json(code2, timeout=30)
 
 
-def _get_provider_info(provider: str) -> dict:
-    if not SCOUT_DB.exists():
-        return {}
-    conn = sqlite3.connect(SCOUT_DB)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM providers WHERE name=?", (provider.lower(),)).fetchone()
-    conn.close()
-    return dict(row) if row else {}
+def nav_link(url: str) -> dict:
+    code = f"""
+import json, time
+new_tab({json.dumps(url)})
+wait_for_load()
+time.sleep(3)
+info = page_info()
+print(json.dumps({{'url': info.get('url',''), 'title': info.get('title','')}}))
+"""
+    return bh_json(code, timeout=20)
 
 
-def _gen_password() -> str:
-    import secrets, string
-    chars = string.ascii_letters + string.digits
-    return "".join(secrets.choice(chars) for _ in range(16))
+def get_api_key(api_key_url: str) -> str | None:
+    code = f"""
+import json, time
+new_tab({json.dumps(api_key_url)})
+wait_for_load()
+time.sleep(3)
+create_r = js({json.dumps(_FIND_KEY_JS)})
+if isinstance(create_r, dict) and create_r.get('hasCreate'):
+    # try clicking create button
+    click_js = '''(function() {{
+        var b = Array.from(document.querySelectorAll('button,a')).find(b=>/create|add|generate|new.*key/i.test(b.innerText));
+        if (b) {{ b.click(); return true; }}
+        return false;
+    }})()'''
+    js(click_js)
+    import time as t; t.sleep(2)
+r2 = js({json.dumps(_FIND_KEY_JS)})
+print(r2 if isinstance(r2, str) else json.dumps(r2))
+"""
+    data = bh_json(code, timeout=30)
+    pat = re.compile(r'^[A-Za-z0-9_\-\.]+$')
+    for val in data.get("inputs", []) + data.get("codes", []):
+        val = val.strip()
+        if 20 < len(val) < 300 and pat.match(val):
+            return val
+    return None
 
 
-# ── Commands ──────────────────────────────────────────────────────────────────
+# ── email ──────────────────────────────────────────────────────────────────────
 
-def cmd_start(provider: str):
-    info = _get_provider_info(provider)
-    signup_url = info.get("signup_url") or ""
-    models = json.loads(info.get("models") or "[]")
-    best_model = models[0] if models else "unknown"
+def _body(msg) -> str:
+    out = ""
+    if msg.is_multipart():
+        for p in msg.walk():
+            if p.get_content_type() in ("text/plain", "text/html"):
+                try: out += p.get_payload(decode=True).decode("utf-8", errors="replace")
+                except Exception: pass
+    else:
+        try: out = msg.get_payload(decode=True).decode("utf-8", errors="replace")
+        except Exception: pass
+    return out
 
-    if not signup_url:
-        print(f"ERROR: No signup URL for {provider} in scout DB.")
-        print(f"Add it first: python3 {SCRIPT_DIR.parent}/llm-scout/scout.py add '{{\"name\":\"{provider}\",\"signup_url\":\"<url>\"}}'")
+
+def poll_verify(hint: str, timeout_min: int = 10) -> str | None:
+    print(f"[register] Polling inbox for {hint} verification email...")
+    deadline = time.time() + timeout_min * 60
+    while time.time() < deadline:
+        try:
+            m = imaplib.IMAP4_SSL(IMAP_HOST)
+            m.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            m.select("INBOX")
+            _, data = m.search(None, "UNSEEN")
+            for uid in reversed((data[0] or b"").split()):
+                _, raw = m.fetch(uid, "(RFC822)")
+                msg = email_lib.message_from_bytes(raw[0][1])
+                sender = (msg.get("From") or "").lower()
+                subj = (msg.get("Subject") or "").lower()
+                if hint in sender or hint in subj or any(k in subj for k in ("verify","confirm","activate")):
+                    body = _body(msg)
+                    links = re.findall(r'https?://[^\s<>"\']+', body)
+                    vlinks = [l for l in links if any(k in l.lower() for k in ("verify","confirm","activate","token","validation"))]
+                    link = (vlinks or links or [None])[0]
+                    if link:
+                        m.store(uid, "+FLAGS", "\\Seen")
+                        m.logout()
+                        print(f"[register] Verify link: {link}")
+                        return link
+            m.logout()
+        except Exception as e:
+            print(f"[register] IMAP: {e}", file=sys.stderr)
+        remaining = int(deadline - time.time())
+        if remaining > 10:
+            print(f"[register] No email yet ({remaining}s left)...")
+            time.sleep(30)
+    return None
+
+
+def poll_reply(timeout_min: int = 30) -> bool:
+    print(f"[register] Waiting for user 'done' reply...")
+    deadline = time.time() + timeout_min * 60
+    while time.time() < deadline:
+        try:
+            m = imaplib.IMAP4_SSL(IMAP_HOST)
+            m.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            m.select("INBOX")
+            _, data = m.search(None, "UNSEEN")
+            for uid in reversed((data[0] or b"").split()):
+                _, raw = m.fetch(uid, "(RFC822)")
+                msg = email_lib.message_from_bytes(raw[0][1])
+                sender = (msg.get("From") or "").lower()
+                body = _body(msg).lower()
+                if USER_EMAIL.lower() in sender and any(k in body for k in ("done","solved","ok","yes","complete")):
+                    m.store(uid, "+FLAGS", "\\Seen")
+                    m.logout()
+                    return True
+            m.logout()
+        except Exception as e:
+            print(f"[register] IMAP: {e}", file=sys.stderr)
+        time.sleep(60)
+    return False
+
+
+def _smtp(subject: str, body: str):
+    if not USER_EMAIL: return
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_ADDRESS
+    msg["To"] = USER_EMAIL
+    msg.attach(MIMEText(body, "plain"))
+    with smtplib.SMTP(SMTP_HOST, 587) as s:
+        s.starttls()
+        s.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        s.sendmail(EMAIL_ADDRESS, USER_EMAIL, msg.as_string())
+
+
+def captcha_alert(provider: str, url: str):
+    _smtp(f"[Hermes] CAPTCHA needed - {provider}",
+          f"CAPTCHA at: {url}\n\nSolve it then reply 'done'.\n\n- Hermes")
+    print(f"[register] CAPTCHA alert -> {USER_EMAIL}")
+
+
+def send_report(provider: str, model: str, ok: bool, notes: str = ""):
+    label = "SUCCESS" if ok else "FAILED"
+    body = (f"Registered: {provider}\nModel: {model}\nKey in llm-keypool (agentic).\n{notes}\n\n- Hermes"
+            if ok else f"Failed: {provider}\n{notes}\n\n- Hermes")
+    _smtp(f"[Hermes] Registration {label} - {provider}", body)
+    print(f"[register] Report sent: {label}")
+
+
+# ── main ───────────────────────────────────────────────────────────────────────
+
+def register(provider_name: str):
+    cfg = PROVIDERS.get(provider_name.lower())
+    if not cfg:
+        print(f"Unknown provider: {provider_name}. Supported: {', '.join(PROVIDERS)}")
         sys.exit(1)
 
-    password = _gen_password()
-    _set_state(provider, "awaiting_verify", signup_url=signup_url, password=password, model=best_model)
-
-    print("=" * 60)
-    print(f"REGISTRAR: {provider} - Step 1 of 4")
-    print("=" * 60)
-    print()
-    print("ACTION: Open signup page and fill the form using browser-harness:")
-    print()
-    print(f"  Signup URL : {signup_url}")
-    print(f"  Email      : {EMAIL_ADDRESS or '<EMAIL_ADDRESS env var>'}")
-    print(f"  Name       : Hermes Agent")
-    print(f"  Password   : {password}")
-    print()
-    print("Use browser-harness to:")
-    print("  1. new_tab(\"" + signup_url + "\")")
-    print("  2. wait_for_load()")
-    print("  3. Fill email, name, password fields")
-    print("  4. Submit the form")
-    print()
-    print("NEXT COMMAND (run after submitting the form):")
-    print(f"  python3 {SCRIPT_DIR}/register.py {provider} verify")
-    print("=" * 60)
-
-
-def cmd_verify(provider: str):
-    state = _get_state(provider)
-    if not state:
-        print(f"ERROR: No registration in progress for {provider}. Run 'start' first.")
+    if not EMAIL_ADDRESS or not EMAIL_PASSWORD:
+        print("ERROR: EMAIL_ADDRESS or EMAIL_PASSWORD not set")
         sys.exit(1)
 
-    print("=" * 60)
-    print(f"REGISTRAR: {provider} - Step 2 of 4")
-    print("=" * 60)
-    print()
-    print("ACTION: Polling hermes inbox for verification email...")
-    print(f"  Checking: {EMAIL_ADDRESS}")
-    print()
+    name = cfg["name"]
+    pw = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(18))
 
-    result = subprocess.run(
-        ["python3", str(REGISTRAR_PY), "wait-verify", provider],
-        capture_output=True, text=True, timeout=660
-    )
+    print(f"\n[register] {name} - autonomous signup")
+    print(f"[register] Email: {EMAIL_ADDRESS}")
+    print(f"[register] Signup: {cfg['signup_url']}")
 
-    verify_link = result.stdout.strip()
-    if result.returncode != 0 or not verify_link:
-        print("ERROR: No verification email received within 10 minutes.")
-        print(result.stderr)
-        print()
-        print("NEXT COMMAND (mark as failed):")
-        print(f"  python3 {SCRIPT_DIR}/register.py {provider} fail 'no verification email'")
+    # 1. navigate, fill, submit
+    print("\n[register] Step 1: Fill and submit signup form")
+    result = navigate_fill_submit(cfg["signup_url"], EMAIL_ADDRESS, pw)
+    print(f"[register] {result}")
+
+    if result.get("captcha"):
+        print("[register] CAPTCHA detected - alerting user")
+        captcha_alert(name, result.get("url", cfg["signup_url"]))
+        if not poll_reply(30):
+            send_report(provider_name, "", False, "CAPTCHA timeout - no user reply")
+            sys.exit(1)
+        # retry submit after captcha
+        result = navigate_fill_submit(cfg["signup_url"], EMAIL_ADDRESS, pw)
+        print(f"[register] After captcha: {result}")
+
+    if result.get("error"):
+        print("[register] Warning: error detected on page after submit (may already be registered or form failed)")
+
+    # 2. email verification
+    print("\n[register] Step 2: Email verification")
+    link = poll_verify(cfg["email_hint"], timeout_min=10)
+    if link:
+        print(f"\n[register] Step 3: Navigate verification link")
+        nav = nav_link(link)
+        print(f"[register] Now at: {nav.get('url','?')}")
+        time.sleep(2)
+    else:
+        print("[register] No verification email (may not be required, continuing)")
+
+    # 3. extract API key
+    print(f"\n[register] Step 4: Extract API key from {cfg['api_key_url']}")
+    api_key = get_api_key(cfg["api_key_url"])
+
+    if not api_key:
+        print("[register] Could not extract key automatically")
+        send_report(provider_name, "", False,
+                    f"Key not found at {cfg['api_key_url']} - register manually at {cfg['signup_url']}")
         sys.exit(1)
 
-    _set_state(provider, "awaiting_key")
-    print(f"Verification link found: {verify_link}")
-    print()
-    print("ACTION: Navigate to the verification link using browser-harness:")
-    print()
-    print(f"  new_tab(\"{verify_link}\")")
-    print(f"  wait_for_load()")
-    print(f"  capture_screenshot()")
-    print()
-    print("NEXT COMMAND (run after verification page loads):")
-    print(f"  python3 {SCRIPT_DIR}/register.py {provider} getkey")
-    print("=" * 60)
+    print(f"[register] Key found: {api_key[:8]}...{api_key[-4:]}")
 
-
-def cmd_getkey(provider: str):
-    info = _get_provider_info(provider)
-    signup_url = info.get("signup_url") or ""
-    base = signup_url.split("/")[0] + "//" + signup_url.split("/")[2] if signup_url else "<provider dashboard>"
-
-    print("=" * 60)
-    print(f"REGISTRAR: {provider} - Step 3 of 4")
-    print("=" * 60)
-    print()
-    print("ACTION: Navigate to API keys page and copy the key using browser-harness:")
-    print()
-    print("Try these URLs in order (stop at the one that works):")
-    for path in ["/api-keys", "/settings/api-keys", "/account/api-keys", "/dashboard/api-keys", "/dashboard"]:
-        print(f"  {base}{path}")
-    print()
-    print("browser-harness steps:")
-    print(f"  new_tab(\"{base}/api-keys\")  # or whichever URL works")
-    print("  wait_for_load()")
-    print("  capture_screenshot()  # find 'Create API Key' or 'Generate Key' button")
-    print("  # click the button, copy the displayed key")
-    print()
-    print("NEXT COMMAND (replace <key> with the actual API key):")
-    print(f"  python3 {SCRIPT_DIR}/register.py {provider} addkey <key>")
-    print("=" * 60)
-
-
-def cmd_addkey(provider: str, api_key: str):
-    if not api_key or api_key == "<key>":
-        print("ERROR: provide the actual API key")
-        print(f"Usage: python3 {SCRIPT_DIR}/register.py {provider} addkey sk-abc123...")
-        sys.exit(1)
-
-    state = _get_state(provider)
-    model = state.get("model") or "unknown"
-
-    print("=" * 60)
-    print(f"REGISTRAR: {provider} - Step 4 of 4")
-    print("=" * 60)
-    print()
-    print(f"Adding key to llm-keypool (provider={provider}, model={model})...")
-
-    result = subprocess.run(
-        ["llm-keypool", "add", "--provider", provider, "--key", api_key, "--model", model, "--category", "general_purpose"],
+    # 4. add to keypool
+    print("\n[register] Step 5: Add to llm-keypool")
+    r = subprocess.run(
+        ["llm-keypool", "add", "--provider", provider_name, "--key", api_key,
+         "--model", cfg["model"], "--category", "agentic"],
         capture_output=True, text=True
     )
-
-    if result.returncode != 0:
-        print(f"llm-keypool add failed: {result.stderr}")
-        print()
-        print("NEXT COMMAND:")
-        print(f"  python3 {SCRIPT_DIR}/register.py {provider} fail 'llm-keypool add failed: {result.stderr.strip()}'")
+    if r.returncode != 0:
+        print(f"[register] keypool add failed: {r.stderr}")
+        send_report(provider_name, "", False, f"llm-keypool add failed: {r.stderr.strip()}")
         sys.exit(1)
+    print(f"[register] Added to keypool (agentic category)")
 
-    print(result.stdout.strip() or "Key added.")
+    # mark scout DB
+    if SCOUT_PY.exists():
+        subprocess.run(["python3", str(SCOUT_PY), "mark-registered", provider_name], capture_output=True)
 
-    # mark registered in scout DB
-    subprocess.run(
-        ["python3", str(SCRIPT_DIR.parent / "llm-scout" / "scout.py"), "mark-registered", provider],
-        capture_output=True
-    )
+    # 5. report
+    notes = cfg.get("notes", "")
+    send_report(provider_name, cfg["model"], True, notes)
+    print(f"\n[register] Done! {name} registered.")
+    if notes:
+        print(f"[register] Note: {notes}")
 
-    _set_state(provider, "complete", api_key=api_key)
-
-    # send success report
-    subprocess.run(["python3", str(REGISTRAR_PY), "send-report", provider, model, "success"], capture_output=True)
-
-    print()
-    print(f"SUCCESS: {provider} registered. Key added to llm-keypool.")
-    print(f"Run 'llm-keypool status' to verify.")
-    print("=" * 60)
-
-
-def cmd_fail(provider: str, reason: str):
-    state = _get_state(provider)
-    model = state.get("model") or ""
-    _set_state(provider, "failed", notes=reason)
-    subprocess.run(["python3", str(REGISTRAR_PY), "send-report", provider, model, "failed", reason], capture_output=True)
-    print(f"Marked {provider} as failed: {reason}")
-    print("Report emailed to user.")
-
-
-def cmd_status(provider: str):
-    state = _get_state(provider)
-    if state:
-        print(json.dumps(state, indent=2))
-    else:
-        print(f"No registration record for {provider}")
-
-
-# ── Entrypoint ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
-
-    provider = sys.argv[1].lower().strip()
-    command = sys.argv[2].lower().strip()
-
-    if command == "start":
-        cmd_start(provider)
-    elif command == "verify":
-        cmd_verify(provider)
-    elif command == "getkey":
-        cmd_getkey(provider)
-    elif command == "addkey":
-        api_key = sys.argv[3] if len(sys.argv) > 3 else ""
-        cmd_addkey(provider, api_key)
-    elif command == "fail":
-        reason = sys.argv[3] if len(sys.argv) > 3 else "unknown"
-        cmd_fail(provider, reason)
-    elif command == "status":
-        cmd_status(provider)
-    else:
-        print(f"Unknown command: {command}")
-        print(__doc__)
-        sys.exit(1)
+    register(sys.argv[1])
