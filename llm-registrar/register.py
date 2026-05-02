@@ -82,13 +82,32 @@ PROVIDERS = {
 
 # ── browser-harness ────────────────────────────────────────────────────────────
 
+_BH_CANDIDATES = [
+    "/Users/azzbeeter/.local/bin/browser-harness",
+    os.path.expanduser("~/.local/bin/browser-harness"),
+    "/opt/homebrew/bin/browser-harness",
+]
+
+def _find_bh() -> str:
+    import shutil
+    found = shutil.which("browser-harness")
+    if found:
+        return found
+    for p in _BH_CANDIDATES:
+        if os.path.exists(p):
+            return p
+    return "browser-harness"
+
+_BH = _find_bh()
+
+
 def bh(code: str, timeout: int = 60) -> str:
     """Run Python code via browser-harness stdin. Return stdout+stderr."""
     try:
-        r = subprocess.run(["browser-harness"], input=code, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run([_BH], input=code, capture_output=True, text=True, timeout=timeout)
         return ((r.stdout or "") + (r.stderr or "")).strip()
     except FileNotFoundError:
-        print("[register] ERROR: browser-harness not on PATH", file=sys.stderr)
+        print(f"[register] ERROR: browser-harness not found (tried: {_BH})", file=sys.stderr)
         sys.exit(1)
     except subprocess.TimeoutExpired:
         return "[TIMEOUT]"
